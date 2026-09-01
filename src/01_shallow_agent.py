@@ -1,31 +1,46 @@
+"""Step 1: A shallow agent — the classic reactive tool loop, running locally.
+
+Works for short tasks; degrades on long multi-step work because all state
+lives in the context window. On a local model that ceiling arrives far sooner
+than it does in the cloud: 32k tokens, not 200k.
 """
-Step 1: A shallow agent — the classic reactive tool loop.
-Works for short tasks; degrades on long multi-step work because
-all state lives in the context window.
-"""
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import os
-from tavily import TavilyClient
-from langchain.agents import create_agent
+import sys
 
-tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from langchain.agents import create_agent  # noqa: E402
+
+from local_model import build_local_model, describe  # noqa: E402
+from search import internet_search, require_key  # noqa: E402
 
 
-def internet_search(query: str, max_results: int = 3) -> dict:
-    """Run a web search and return results."""
-    return tavily.search(query, max_results=max_results)
+def main() -> None:
+    # Before the first model call, not several tool calls into the run.
+    require_key()
+    model = build_local_model()
+    print(f"[shallow agent] {describe(model)}\n")
 
+    agent = create_agent(
+        model=model,
+        tools=[internet_search],
+        system_prompt="You are a helpful research assistant.",
+    )
 
-agent = create_agent(
-    model="anthropic:claude-sonnet-4-6",
-    tools=[internet_search],
-    system_prompt="You are a helpful research assistant.",
-)
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "What is PagedAttention in vLLM?"}]}
+    )
+    print(result["messages"][-1].content)
+
+    # The whole run lives here. Watch this number when you move on to the
+    # multi-part task in the blog post: every raw tool result is still in it.
+    print(f"\n[messages in context: {len(result['messages'])}]")
+
 
 if __name__ == "__main__":
-    result = agent.invoke({
-        "messages": [{"role": "user", "content": "What is PagedAttention in vLLM?"}]
-    })
-    print(result["messages"][-1].content)
+    main()

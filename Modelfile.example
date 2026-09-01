@@ -1,0 +1,25 @@
+# Bake the agent's context window into the model itself.
+#
+# Why you'd want this: `num_ctx` is an Ollama parameter, and the OpenAI chat
+# API has nowhere to put it. So when you reach the model through an
+# OpenAI-compatible front door — OllaBridge, or anything else — you cannot set
+# the window per request, and you get whatever default the model was built
+# with (often far smaller than you want).
+#
+# Building your own tag fixes that everywhere at once: direct Ollama, through a
+# gateway, from any SDK. The window travels with the model.
+#
+#   ollama create qwen3-agent -f Modelfile.example
+#   ollama list                       # qwen3-agent appears
+#
+# Then point the tutorial at it:
+#
+#   DEEP_AGENT_MODEL=qwen3-agent
+#
+# 24576 is sized for a 12 GB card. Raise it if you have more VRAM, and re-run
+# `make doctor` afterwards to confirm it still fits.
+
+FROM qwen3:8b
+
+PARAMETER num_ctx 24576
+PARAMETER temperature 0
