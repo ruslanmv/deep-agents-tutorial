@@ -9,6 +9,7 @@ Checks, in the order that they will bite you:
   5. num_ctx fits in VRAM alongside the weights.
   6. The model can really emit a tool call — the gate most small models fail.
  6b. Where the model actually landed: GPU, or spilled to the CPU.
+ 6c. How fast it generates, and whether it is burning hidden thinking tokens.
   7. deepagents assembles a graph against it, with the expected tools.
 
 Exits non-zero on the first hard failure, so `make doctor` is usable in CI.
@@ -28,9 +29,16 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from local_model import DEFAULT_MODEL, DEFAULT_NUM_CTX, build_local_model  # noqa: E402
+from local_model import (  # noqa: E402
+    DEFAULT_MODEL,
+    DEFAULT_NUM_CTX,
+    build_local_model,
+    normalize_base_url,
+)
 
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+# Resolved the same way the labs resolve it, so the doctor cannot end up
+# probing a different daemon than the one the agents will actually use.
+OLLAMA_HOST = normalize_base_url(os.environ.get("OLLAMA_HOST", ""))
 MODEL = os.environ.get("DEEP_AGENT_MODEL", DEFAULT_MODEL)
 NUM_CTX = int(os.environ.get("DEEP_AGENT_NUM_CTX", DEFAULT_NUM_CTX))
 
@@ -239,6 +247,71 @@ def check_tool_calling() -> None:
         )
 
 
+def check_speed_and_thinking() -> None:
+    """How fast does it generate, and is it silently spending tokens thinking?
+
+    This is the check for the run that is healthy on every other measure and
+    still takes ten minutes. Two things cause that on a GPU-resident model:
+
+    * The model is thinking. qwen3 is a hybrid reasoning model, and a long
+      `<think>` block costs hundreds of tokens per turn that you never see in
+      the answer. `reasoning=False` asks Ollama to turn that off, but the
+      `think` parameter needs a recent Ollama and a model that honours it — so
+      measure rather than assume.
+    * Generation is simply slow, which points back at the GPU.
+
+    Both show up as tokens: how many, and how fast.
+    """
+    section("6c. Generation speed, and whether it is thinking")
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content":
+                      "In one short sentence, what is a KV cache?"}],
+        "stream": False,
+        "think": False,
+        "keep_alive": os.environ.get("DEEP_AGENT_KEEP_ALIVE", "30m"),
+        "options": {"num_ctx": NUM_CTX, "temperature": 0},
+    }
+    try:
+        body = _api("/api/chat", payload=payload, timeout=180)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        warn(f"could not run the speed probe: {exc}")
+        return
+
+    msg = body.get("message") or {}
+    thinking = (msg.get("thinking") or "").strip()
+    eval_count = body.get("eval_count") or 0
+    eval_ns = body.get("eval_duration") or 0
+    prompt_count = body.get("prompt_eval_count") or 0
+    prompt_ns = body.get("prompt_eval_duration") or 0
+
+    if eval_count and eval_ns:
+        tps = eval_count / (eval_ns / 1e9)
+        print(f"        generated {eval_count} tokens at {tps:.0f} tok/s")
+        if tps < 15:
+            warn(
+                f"{tps:.0f} tok/s is slow for a local 8B on a GPU. A deep-agent "
+                "run makes dozens of calls, so this is minutes per step. Check "
+                "6b above, and close anything else using the card."
+            )
+        else:
+            ok(f"{tps:.0f} tok/s — fine for a deep agent")
+    if prompt_count and prompt_ns:
+        pps = prompt_count / (prompt_ns / 1e9)
+        print(f"        read the prompt at {pps:.0f} tok/s")
+
+    if thinking:
+        fail(
+            f"the model returned a {len(thinking)} character reasoning block "
+            "even though thinking was switched off. Every turn pays for tokens "
+            "you never see, which is the usual reason a healthy GPU still takes "
+            "minutes per step. Update Ollama (`think` needs a recent version), "
+            "or use a model without a thinking mode."
+        )
+    else:
+        ok("thinking is off — no hidden reasoning tokens per turn")
+
+
 def check_residency(has_gpu: bool = True) -> None:
     """Where did the model actually land? Estimates lie; /api/ps measures.
 
@@ -363,6 +436,7 @@ if __name__ == "__main__":
     check_context(vram, size_bytes)
     check_tool_calling()
     check_residency(has_gpu=vram is not None)
+    check_speed_and_thinking()
     check_deep_agent()
     summary()
     sys.exit(1 if _failures else 0)

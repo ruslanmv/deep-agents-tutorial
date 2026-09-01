@@ -25,6 +25,64 @@ _FIRST_CALL_HINT = (
     "30-60s is normal, longer on a cold cache"
 )
 
+# Past this, a single orchestrator turn is not "a local model being slow", it is
+# a model that did not fit on the GPU. The reference run does a whole turn in
+# about three seconds.
+_SLOW_TURN_SECONDS = 25.0
+
+
+def _residency_warning() -> str:
+    """A diagnosis, if the loaded model is not actually on the GPU.
+
+    Called once, right after the first model call, because that is the moment
+    the weights are resident and `/api/ps` can be believed. Returns "" when
+    everything is fine, when there is no GPU to speak of, or when we cannot
+    tell — this is a hint, never a blocker.
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("DEEP_AGENT_BACKEND", "ollama").strip().lower() not in {
+        "",
+        "ollama",
+    }:
+        return ""  # a gateway backend has no local /api/ps to ask
+    try:
+        from local_model import gpu_residency  # noqa: PLC0415
+    except ImportError:
+        return ""
+
+    info = gpu_residency()
+    if not info or info["pct"] >= 99:
+        return ""
+
+    gib = 1024**3
+    pct = info["pct"]
+    where = (
+        "entirely on the CPU"
+        if pct <= 1
+        else f"only {pct:.0f}% on the GPU — the rest is on the CPU"
+    )
+    ctx = os.environ.get("DEEP_AGENT_NUM_CTX", "24576")
+    try:
+        smaller = max(4096, int(ctx) // 2)
+    except ValueError:
+        smaller = 12288
+    return (
+        f"\n  [slow] {info['name']} is {where} "
+        f"({info['on_gpu'] / gib:.1f} of {info['total'] / gib:.1f} GiB in VRAM).\n"
+        f"         That is why this is crawling — expect minutes per step, not "
+        f"seconds.\n"
+        f"         Cheapest fixes first, in .env or in front of the command:\n"
+        f"           {f'DEEP_AGENT_NUM_CTX={smaller}':<28}"
+        f"# smaller KV cache, frees VRAM\n"
+        f"           {'DEEP_AGENT_MODEL=qwen3:4b':<28}"
+        f"# smaller weights (make model MODEL=qwen3:4b)\n"
+        f"           {'OLLAMA_KV_CACHE_TYPE=q8_0':<28}"
+        f"# on the Ollama server — halves the cache\n"
+        f"         Close whatever else is using VRAM, then `make doctor` "
+        f"(check 6b) to confirm.\n"
+    )
+
 
 def _text_of(msg: Any) -> str:
     """Best-effort plain text of a message, whatever shape its content is."""
@@ -71,44 +129,91 @@ def run_with_progress(agent: Any, payload: dict, *, label: str = "run") -> dict:
     print(f"          ({_FIRST_CALL_HINT})\n")
 
     final: dict | None = None
-    pending: dict[str, float] = {}   # tool name -> when the model asked for it
+    pending: dict[tuple, float] = {}   # (scope, tool name) -> when it was asked for
     steps = 0
+    sub_steps = 0            # model turns that happened inside sub-agents
+    diagnosed = False        # the residency hint is printed at most once
+    last_reply_at = 0.0      # when the previous model turn came back
 
-    for mode, chunk in agent.stream(payload, stream_mode=["updates", "values"]):
+    # subgraphs=True is what makes a `task` call stop being a black box. Without
+    # it a sub-agent is one tool call that returns minutes later having told you
+    # nothing — which is exactly the run you cannot debug.
+    stream = agent.stream(
+        payload, stream_mode=["updates", "values"], subgraphs=True
+    )
+    for namespace, mode, chunk in stream:
+        inside = bool(namespace)
         if mode == "values":
-            final = chunk
+            # Only the outer graph's state is the run's result; a sub-agent's
+            # values would otherwise overwrite it with its own scratch state.
+            if not inside:
+                final = chunk
             continue
+
+        # Indent anything happening inside a sub-agent, and keep its pending
+        # tool calls in their own namespace so timings do not cross over.
+        scope = namespace[0].split(":")[0] if inside else ""
+        mark = "  ↳ " if inside else ""
 
         for node, update in (chunk or {}).items():
             for msg in (update or {}).get("messages") or []:
                 now = time.perf_counter() - t0
 
                 if isinstance(msg, AIMessage):
+                    # The first reply means the weights are loaded, so this is
+                    # the earliest moment /api/ps can be believed — and the
+                    # earliest we can tell someone their run will take ten
+                    # minutes instead of one.
+                    first = not diagnosed
+                    if first:
+                        diagnosed = True
+                        warning = _residency_warning()
+                        if warning:
+                            print(warning)
+
+                    # How long the model spent on this turn. Skipped for the
+                    # first one, which legitimately includes the weight load.
+                    think = now - last_reply_at
+                    slow = ""
+                    if not first and think > _SLOW_TURN_SECONDS:
+                        slow = f"   [{think:.0f}s on this turn — not normal]"
+                    last_reply_at = now
+
                     calls = _tool_names(msg)
                     if calls:
-                        steps += 1
-                        for name in calls:
-                            pending[name] = now
+                        if inside:
+                            sub_steps += 1
+                        else:
+                            steps += 1
+                        for i, name in enumerate(calls):
+                            pending[(scope, name)] = now
                             extra = ""
                             # A `task` call is a whole sub-agent run happening
-                            # inside one tool call. Nothing streams out of it,
-                            # so warn that this gap is expected to be long.
+                            # inside one tool call. Its own turns are printed
+                            # indented underneath, as they happen.
                             if name == "task":
-                                extra = "  (a sub-agent runs here — expect a long pause)"
-                            print(f"  {now:7.1f}s  ask  {name}{extra}")
+                                extra = "  (a sub-agent runs here)"
+                            # The timing note belongs to the turn, not to each
+                            # tool it asked for.
+                            print(f"  {now:7.1f}s  {mark}ask  {name}{extra}"
+                                  f"{slow if i == 0 else ''}")
                     elif _text_of(msg):
-                        print(f"  {now:7.1f}s  ---  the agent gave its final answer")
+                        what = ("the sub-agent reported back" if inside
+                                else "the agent gave its final answer")
+                        print(f"  {now:7.1f}s  {mark}---  {what}{slow}")
 
                 elif isinstance(msg, ToolMessage):
                     name = msg.name or "?"
-                    started = pending.pop(name, None)
+                    started = pending.pop((scope, name), None)
                     took = f"  ({now - started:.1f}s)" if started is not None else ""
                     body = str(msg.content).replace("\n", " ")
                     flag = "ERR " if body.startswith("Error") else "got "
-                    print(f"  {now:7.1f}s  {flag}{name}{took}")
+                    print(f"  {now:7.1f}s  {mark}{flag}{name}{took}")
                     if flag == "ERR ":
                         print(f"           {body[:160]}")
 
     total = time.perf_counter() - t0
-    print(f"\n[{label}] finished in {total:.1f}s over {steps} tool-calling turns\n")
+    inner = f", plus {sub_steps} inside sub-agents" if sub_steps else ""
+    print(f"\n[{label}] finished in {total:.1f}s over {steps} tool-calling "
+          f"turns{inner}\n")
     return final or {}

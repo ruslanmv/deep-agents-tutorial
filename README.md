@@ -1,301 +1,196 @@
-<div align="center">
-
 # Deep Agents on Your Own GPU
 
-### A hands-on lab for building local, tool-using agents with planning, files, and sub-agents
+Companion code for the blog post **"Deep Agents on Your Own GPU: A Hands-On Lab"** by Ruslan Magana Vsevolodovna — [ruslanmv.com](https://ruslanmv.com).
 
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-000000?logo=ollama&logoColor=white)](https://ollama.com/)
-[![uv](https://img.shields.io/badge/uv-Package%20Manager-DE5FE9)](https://docs.astral.sh/uv/)
-[![Deep Agents](https://img.shields.io/badge/DeepAgents-0.7%2B-1C3C3C)](https://github.com/langchain-ai/deepagents)
+Build an agent that plans, takes notes and delegates — the architecture behind tools like Claude Code — running entirely on your own graphics card with [Ollama](https://ollama.com) and the [`deepagents`](https://github.com/langchain-ai/deepagents) library.
 
-**No model API key. No per-token bill. Your model, your GPU.**
+**No API key for the model.** A free Tavily key is the only cloud service, and only because the agent needs to search the web.
 
-[Read the article](https://ruslanmv.com/blog/Deep-Agents-on-Your-Own-GPU-A-Hands-On-Lab) · [Quick start](#quick-start) · [Explore the labs](#labs) · [Troubleshooting](#troubleshooting)
+> The post is the tutorial; this README is the reference. Tables, defaults and gotchas live here so the post can stay readable.
 
-</div>
+## Start here
 
+```bash
+make setup     # uv sync — installs into ./.venv, touches nothing else
+make env       # copies .env.example to .env (then add your TAVILY_API_KEY)
+make model     # ollama pull qwen3:8b (about 5 GB)
+make doctor    # checks your machine can do this — get this green first
+```
 
+Then pick a lab. `make help` lists everything. Something misbehaving? [TROUBLESHOOTING.md](TROUBLESHOOTING.md) collects every symptom and its fix.
 
-## Overview
+You'll need [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com/download), Python 3.11+, and a free [Tavily](https://tavily.com) key.
 
-This repository is the companion project for **“Deep Agents on Your Own GPU: A Hands-On Lab.”** It shows how to move beyond a basic ReAct loop and build a more capable local agent that can:
+## The labs
 
-- create and maintain an explicit plan;
-- write durable notes to a virtual filesystem;
-- delegate focused work to isolated sub-agents;
-- search, inspect, and edit files with built-in tools;
-- stream progress and trace complete runs; and
-- use the same local model directly through Ollama or through an OpenAI-compatible gateway.
-
-The default setup uses [`qwen3:8b`](https://ollama.com/library/qwen3), served locally by Ollama. It is sized for a 12 GB NVIDIA GPU, but every lab can also run on CPU at a slower pace.
-
-## Why deep agents?
-
-A plain ReAct agent keeps the original request, reasoning, and every raw tool result in one growing conversation. On a long task, that context becomes noisy and can eventually be truncated without an obvious error.
-
-A deep agent gives the same model a better working environment:
-
-| Capability | Plain ReAct agent | Deep agent |
+| Target | File | What it shows |
 |---|---|---|
-| Planning | Implicit in the conversation | Explicit to-do list |
-| Working memory | One growing context | Notes stored as files |
-| Delegation | None | Isolated sub-agent contexts |
-| Long-task behavior | Tool output crowds out instructions | Orchestrator context stays focused |
-| Reproducibility | Final response only | Notes, reports, traces, and tool history |
+| `make shallow` | `01_shallow_agent.py` | The plain ReAct loop, and where it breaks |
+| `make deep` | `02_deep_agent.py` | Plan + files + a researcher sub-agent |
+| `make toolbox` | `04_toolbox_agent.py` | The built-in tools, auditing a tiny project — **no API key** |
+| `make observed` | `03_observed_agent.py` | Tracing a whole run with Langfuse |
+| `make ollabridge` | `05_ollabridge_demo.py` | The same model through an OllaBridge gateway — **nothing to configure** |
+| `make advanced` | `06_advanced_agent.py` | Custom middleware and harness settings — **no API key** |
 
-The key idea is simple: **one instruction goes into a sub-agent, one compact result comes back, and the noisy intermediate work stays isolated.**
+Supporting files: `local_model.py` (the settings that make local deep agents work), `search.py` (token-trimmed web search), `progress.py` (streams a line per model and tool call, so a slow run doesn't look like a hang), `keys.py` (checks hosted-service keys at startup, and treats a `.env.example` placeholder as missing), `00_doctor.py` (eight preflight checks), `Modelfile.example` (bake `num_ctx` into your own tag).
 
-## Architecture
+The post's diagrams live in `assets/images/posts/2026-08-23-Deep-Agents-Ollama/` as hand-written SVG. They carry their own `prefers-color-scheme` styles, so they follow the reader's light or dark theme with no JavaScript and no external assets.
 
-```mermaid
-flowchart TD
-    U[User request] --> O[Orchestrator]
-    O --> P[Plan and to-do list]
-    O --> F[Virtual filesystem]
-    O --> S[Research sub-agent]
-    S --> T[Search and tools]
-    S --> F
-    F --> O
-    O --> R[Final report]
+The post's two raster images sit in the same folder: `deep-agents-ollama.jpg` (the header banner, 2400×900) and `deep-agents-ollama-teaser.jpg` (the archive-card teaser, 1600×960). Both are rendered from the `_banner.svg` and `_teaser.svg` sources next to them — edit the SVG, re-render, don't retouch the JPEG.
+
+### A real run, for calibration
+
+`make deep` on the reference machine — RTX 4080 Laptop, 12 GB, `qwen3:8b` at 24576 ctx:
+
+```
+      3.0s  ask  write_todos
+      3.9s  ask  task     (sub-agent: 9.6s)
+     15.5s  ask  task     (sub-agent: 11.5s)
+     29.2s  ask  task     (sub-agent: 9.3s)
+     40.2s  ask  read_file
+     47.2s  ask  write_file
+[deep agent] finished in 49.1s over 6 tool-calling turns
+[virtual filesystem: 3 file(s)]   [orchestrator messages: 14]
 ```
 
-The project separates three layers that are often confused:
+**49 seconds, 14 messages in the orchestrator, three delegations it never saw the inside of.** What it got wrong is worth knowing too: the researchers invented their own file paths instead of the `/notes_1.md` the prompt asked for, one skipped its write entirely, the orchestrator read one note back instead of three, and one sub-agent drifted onto models instead of engines. An 8B model gets the shape right and the details approximate — verify what it wrote rather than trusting it followed instructions. See the post's "What an 8B model does and doesn't obey".
 
-1. **Model** — produces text and tool calls.
-2. **Harness** — maintains the conversation, executes tools, and controls the loop.
-3. **Deep-agent layer** — adds planning, files, sub-agents, and durable operating instructions.
+**Quickest way to see the point:** `make toolbox`. No key, no network. It seeds a four-file fake project into the agent's filesystem, asks for a code audit, and prints the tools it reached for:
 
-## Quick start
-
-### Prerequisites
-
-- Python 3.11 or newer
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-- [`Ollama`](https://ollama.com/download)
-- A Tavily API key for the web-research labs
-- Optional: Langfuse credentials for tracing
-
-### Install and verify
-
-```bash
-git clone https://github.com/ruslanmv/deep-agents-tutorial.git
-cd deep-agents-tutorial
-
-make setup
-make env
-make model
-make doctor
+```
+order: write_todos -> ls -> glob -> grep -> grep -> task -> write_file -> edit_file
 ```
 
-After `make env`, open `.env` and add your Tavily key. The remaining local-model settings already have sensible defaults.
+Nobody wrote that sequence. Plan, get oriented, narrow by name, narrow by content, delegate the reading, write the result, tidy up.
 
-Run the deep-agent lab:
+## Hardware
 
-```bash
-make deep
-```
+The floor is an **RTX 4080 Laptop GPU (12 GB)** — everything is sized to fit it. Bigger cards just get a longer context window.
 
-Want the fastest demonstration with no API key and no network access?
-
-```bash
-make toolbox
-```
-
-Use `make help` to list every available command.
-
-## Labs
-
-| Command | Source | What it demonstrates |
+| Card | VRAM | `DEEP_AGENT_NUM_CTX` |
 |---|---|---|
-| `make shallow` | `src/01_shallow_agent.py` | A plain ReAct tool loop and where it breaks |
-| `make deep` | `src/02_deep_agent.py` | Planning, files, and a focused researcher sub-agent |
-| `make toolbox` | `src/04_toolbox_agent.py` | Built-in file tools and delegation; no API key required |
-| `make observed` | `src/03_observed_agent.py` | End-to-end tracing with Langfuse |
-| `make ollabridge` | `src/05_ollabridge_demo.py` | The same model through an OpenAI-compatible gateway |
-| `make advanced` | `src/06_advanced_agent.py` | Custom middleware and harness profiles; no API key required |
+| **RTX 4080 Laptop** (floor) | **12 GB** | **24576** (default) |
+| RTX 4080 / 5080 Desktop, 5080 Laptop, 4090 Laptop | 16 GB | 32768 |
+| RTX 4090 Desktop, 5090 Laptop | 24 GB | 40960 |
+| RTX 5090 Desktop | 32 GB | 40960, and try a bigger model |
 
-Supporting modules include:
+VRAM is consumed by the model weights *and* by the context window's KV cache, which grows with `num_ctx`. `make doctor` reads the real numbers off your card rather than trusting this table.
 
-| File | Purpose |
-|---|---|
-| `src/local_model.py` | Builds and configures the local model |
-| `src/search.py` | Provides token-conscious web search |
-| `src/progress.py` | Streams model and tool activity |
-| `src/keys.py` | Validates optional hosted-service credentials |
-| `src/00_doctor.py` | Runs hardware, model, and tool-calling checks |
-| `Modelfile.example` | Bakes a context-window setting into a custom Ollama tag |
+No NVIDIA card? It runs on CPU. Slowly, but every lab completes — `make doctor` warns rather than failing, and still exits 0. Budget minutes per step instead of seconds, and consider `DEEP_AGENT_MODEL=qwen3:4b`. (If you *do* have a card and the model still lands 0% on it, that's a real failure and doctor says so: something spilled.)
 
-## Hardware guidance
+## Models
 
-The reference configuration is an **RTX 4080 Laptop GPU with 12 GB of VRAM**. The values below are starting points; `make doctor` checks the actual fit on your machine.
+Default is `qwen3:8b` (~5.2 GB). Change with `make model MODEL=qwen3:14b` plus `DEEP_AGENT_MODEL` in `.env`.
 
-| GPU | VRAM | Suggested `DEEP_AGENT_NUM_CTX` |
-|---|---:|---:|
-| **RTX 4080 Laptop** | **12 GB** | **24576** |
-| RTX 4080/5080 Desktop, RTX 5080/4090 Laptop | 16 GB | 32768 |
-| RTX 4090 Desktop, RTX 5090 Laptop | 24 GB | 40960 |
-| RTX 5090 Desktop | 32 GB | 40960 or a larger model |
+| Model | Weights (Q4) | Good for |
+|---|---|---|
+| `qwen3:4b` | ~2.6 GB | Tight on memory |
+| **`qwen3:8b`** | **~5.2 GB** | **Default — best fit for 12 GB** |
+| `llama3.1:8b` | ~4.9 GB | Alternative at the same size |
+| `qwen3:14b` | ~9.3 GB | 16 GB and up |
+| `gpt-oss:20b` | ~13 GB | 24 GB and up |
 
-No NVIDIA GPU is required. CPU execution works, but budget minutes per step instead of seconds and consider using `qwen3:4b`.
+The hard requirement is **tool calling**. A deep agent is nothing but tool calls, and many small models answer a tool-call prompt with prose instead. That's check 6 of `make doctor`.
 
-## Model selection
+## Three settings that fail silently
 
-The default model is `qwen3:8b`, which offers a practical balance of tool-calling reliability and memory use.
-
-```bash
-make model MODEL=qwen3:14b
-```
-
-Then update `.env`:
-
-```dotenv
-DEEP_AGENT_MODEL=qwen3:14b
-```
-
-| Model | Approximate Q4 size | Recommended use |
-|---|---:|---|
-| `qwen3:4b` | 2.6 GB | Low-memory systems or CPU testing |
-| **`qwen3:8b`** | **5.2 GB** | **Default; best fit for 12 GB VRAM** |
-| `llama3.1:8b` | 4.9 GB | Alternative at a similar size |
-| `qwen3:14b` | 9.3 GB | GPUs with 16 GB or more |
-| `gpt-oss:20b` | 13 GB | GPUs with 24 GB or more |
-
-Whatever model you choose must support tool calling. `make doctor` verifies this before you start a long run.
-
-## Configuration that matters
-
-Three settings in `src/local_model.py` are especially important for local deep agents:
+All in `src/local_model.py`. Each one is quiet when wrong, which is what makes them expensive.
 
 | Setting | Why it matters |
 |---|---|
-| `num_ctx` | Controls the real Ollama context window; an undersized window can silently truncate earlier instructions |
-| `profile={"max_input_tokens": num_ctx}` | Lets the harness compact context relative to the model's actual limit |
-| `keep_alive` | Prevents Ollama from repeatedly unloading and reloading the model during a multi-call run |
+| `num_ctx` | Ollama's default window is small and it **truncates without erroring** — the agent forgets its plan with no traceback |
+| `profile={"max_input_tokens": num_ctx}` | `deepagents` decides when to summarise from `model.profile`. `ChatOllama` publishes none, so the fallback trigger is **170,000 tokens** — on a 24k window it never fires. This moves it to 85% of the real window |
+| `keep_alive` | A run is dozens of short calls; without this Ollama reloads the model each time |
 
-Use one model instance for both the orchestrator and its sub-agents. Loading different models on one GPU can force Ollama to swap weights on every delegation.
+**Looks frozen after the banner?** The labs stream a line per model and tool call, so you should see movement within a minute. A long silent gap on a `task` line is normal: a whole sub-agent runs inside that one tool call and nothing streams out of it.
 
-## Built-in toolbox
+**Crawling rather than frozen?** The labs now diagnose that themselves. Right after the first model call they read `/api/ps`, and if the model did not land fully on the GPU they print a `[slow]` block with the percentage and the fixes worth trying, in order of cost. Turns that take more than 25 seconds get flagged inline too. On WSL the usual cause is a second, CPU-only Ollama running inside WSL alongside the GPU one on Windows — [TROUBLESHOOTING.md](TROUBLESHOOTING.md) has the commands to tell them apart.
 
-`create_deep_agent()` exposes a useful default toolbox:
+Also: use **one model instance** for the main agent and all its sub-agents. Two models on one card means Ollama swapping weights on every delegation.
 
-| Tool | Purpose |
+## The built-in toolbox
+
+`create_deep_agent()` provides all of these before you add any tools of your own.
+
+| Tool | Use it for |
 |---|---|
-| `write_todos` | Plan and track multi-step work |
-| `ls` | Inspect the current directory |
-| `glob` | Narrow files by name or path |
-| `grep` | Find relevant files by literal content |
-| `read_file` | Read only the files that matter |
-| `write_file` | Save research notes and final output |
-| `edit_file` | Apply focused edits |
-| `delete` | Remove temporary files |
-| `task` | Delegate isolated work to a sub-agent |
-| `execute` | Run shell commands when the backend supports it |
+| `write_todos` | Anything with more than about three steps |
+| `ls` | Getting oriented at the start |
+| `glob` | "Which files should I even look at?" |
+| `grep` | Finding the few files that matter (literal text, **not** regex) |
+| `read_file` | Reading only what `grep` pointed at |
+| `write_file` | Saving notes and final output |
+| `edit_file` | Small fixes without rewriting the file |
+| `delete` | Cleaning up scratch files |
+| `task` | Anything that would make a mess in the main context |
+| `execute` | Shell commands — needs a sandbox backend, errors on `StateBackend` |
 
-A practical file-analysis pattern is:
+**The pattern worth stealing:** `glob` → `grep` → `read_file`. Narrow by name, narrow by content, then read only what's left. Reading everything and letting the model sort it out fills a 24k window with files it didn't need. Say so in your system prompt — models don't always do it unprompted.
 
-```text
-glob → grep → read_file
-```
+**Seeding files:** build the values with `create_file_data()` from `deepagents.backends.utils`. A bare `{"content": ...}` dict works for every tool except `glob`, which sorts by modification time and fails with a cryptic `'modified_at'` error.
 
-Narrow by filename, narrow by content, and only then read the remaining files. This keeps limited local context windows focused.
+## Middleware and harness settings
 
-## Example run
+Two ways to change the harness. `make advanced` demonstrates both, no API key needed.
 
-On the reference RTX 4080 Laptop GPU, `qwen3:8b` with a 24,576-token context completed the deep-agent lab in approximately 49 seconds:
+**Middleware** wraps individual calls. You write a class with the hooks you need:
 
-```text
-write_todos
-task          # focused research sub-agent
-task          # focused research sub-agent
-task          # focused research sub-agent
-read_file
-write_file
-```
+| Hook | When |
+|---|---|
+| `before_agent` / `after_agent` | Once per run |
+| `before_model` / `after_model` | Around each model call |
+| `wrap_model_call` | *Around* the model call — read or edit `request.tools`, the prompt |
+| `wrap_tool_call` | *Around* a tool execution — time it, log it, or refuse it |
 
-The orchestrator completed the job in six tool-calling turns while the detailed search work remained inside the delegated contexts. Small local models can still miss requested filenames or skip steps, so inspect the generated report and supporting notes rather than assuming perfect instruction following.
+Not calling `handler()` in `wrap_tool_call` is the whole guardrail: the tool never runs and your `ToolMessage` becomes the result. Every hook has an async twin (`awrap_model_call`, …).
 
-## Observability
+Your middleware is spliced in **after** the built-in core stack and **before** the tail. Reusing an existing `name` **replaces** that entry in place instead of appending — so `name = "SummarizationMiddleware"` swaps out the built-in compaction and keeps its position.
 
-Run the traced example with:
+**Harness settings** (`HarnessProfile`) are declarative defaults attached to a *model*:
 
-```bash
-make observed
-```
+| Field | Effect |
+|---|---|
+| `base_system_prompt` / `system_prompt_suffix` | Prompt assembles as `USER → BASE → SUFFIX` |
+| `excluded_tools` | Tool names withheld from the model |
+| `tool_description_overrides` | Rewrite a built-in tool's description |
+| `extra_middleware` / `excluded_middleware` | Add or remove stack entries |
+| `general_purpose_subagent` | Tune or disable the default catch-all sub-agent |
 
-This records the model calls, tool calls, delegation boundaries, and timing data in Langfuse. Tracing is optional for the other labs but particularly useful when a long agent run appears to drift or stall.
+**The key you register under matters.** Pass a model *string* and that string is the key; pass a pre-built instance (what `build_local_model()` does) and the key is derived from the model, falling back to the provider. For `ChatOllama` that provider is `ollama`, so `register_harness_profile("ollama", ...)` covers every local model here. Mismatch and deepagents logs `No harness profile matched pre-built model …` rather than failing silently.
 
-## OllaBridge gateway
+**And the provider changes with the backend.** `DEEP_AGENT_BACKEND=ollabridge` builds a `ChatOpenAI`, whose provider is `openai` — the gateway speaks the OpenAI API, so that is what it is. A profile registered under `ollama` then matches nothing, and the exclusions and prompt suffix quietly do not apply. `06_advanced_agent.py` picks its key from the active backend for exactly this reason.
 
-[OllaBridge](https://github.com/ruslanmv/ollabridge) exposes local Ollama models and other backends through one OpenAI-compatible endpoint.
+Two guard rails: `excluded_middleware` refuses to strip required scaffolding (`FilesystemMiddleware`, `SubAgentMiddleware`) at the moment you declare the profile, and an exclusion matching nothing raises rather than being ignored.
+
+Rule of thumb: *"this model should never see that tool"* → harness setting. *"watch or intervene per call"* → middleware.
+
+## Using an OllaBridge gateway
+
+[OllaBridge](https://github.com/ruslanmv/ollabridge) fronts every model you can reach — local Ollama, remote GPUs, your own provider keys — behind one OpenAI-compatible URL. This repo supports it as a backend, with no code changes and nothing to configure:
 
 ```bash
 pip install ollabridge
-ollabridge start --auth-mode local-trust --host 127.0.0.1
+ollabridge start --auth-mode local-trust --host 127.0.0.1   # one terminal
+make ollabridge                                             # another
 ```
 
-In another terminal:
+Verified against **OllaBridge 0.1.7** from PyPI, which carries tool calls end to end. `local-trust` skips the key check for requests from this machine, and `--host 127.0.0.1` keeps it listening here only — so there's no `.env` entry and no key to copy. `make ollabridge` sets `DEEP_AGENT_BACKEND=ollabridge` itself for that one command, and `build_local_model()` returns a `ChatOpenAI` pointed at the gateway instead of a `ChatOllama`. Same model, same GPU, different front door. The script verifies chat, then tool calling, then runs a real deep agent through the gateway.
 
-```bash
-make ollabridge
-```
+Two optional overrides, both `.env`:
 
-The lab checks both chat and tool calling before running a real deep agent. If you use a remote or authenticated gateway, configure `OLLABRIDGE_URL` and `OLLABRIDGE_API_KEY` in `.env`.
+- `DEEP_AGENT_BACKEND=ollabridge` — send *every* lab through the gateway, not just `make ollabridge`
+- `OLLABRIDGE_URL` / `OLLABRIDGE_API_KEY` — for a gateway on another host or port, or one started with `--auth-mode required`. Step 1 reports `HTTP 401 — the key was checked` when you need the key
 
-## Troubleshooting
+Two things worth knowing about any OpenAI-compatible proxy:
 
-Start with:
+- **Tool calling has to survive the trip.** A proxy that accepts `tools` and ignores it returns HTTP 200 and a confident prose answer with nothing in the logs. Current OllaBridge carries tool calls; step 3 of `make ollabridge` confirms whichever gateway you actually have.
+- **`num_ctx` cannot be sent.** The OpenAI chat API has no such field, so bake the window into the model instead: `ollama create qwen3-agent -f Modelfile.example`, then set `DEEP_AGENT_MODEL=qwen3-agent`. Worth doing even if you never use a gateway.
 
-```bash
-make doctor
-```
+## Notes on `deepagents` 0.7.x
 
-It checks the GPU, Ollama daemon, installed model, context window, estimated VRAM use, tool calling, actual GPU placement, and deep-agent harness.
+Two behaviours worth knowing, both handled here:
 
-| Symptom | Likely cause | Recommended action |
-|---|---|---|
-| Model answers in prose instead of calling a tool | Model lacks reliable tool-call support | Use `qwen3:8b` or another tool-capable model |
-| Run is unexpectedly slow | Part of the model spilled to CPU | Lower `DEEP_AGENT_NUM_CTX` or select a smaller model |
-| Long pause on a `task` call | A complete sub-agent is running inside that call | Wait; this is normal unless progress stops for several minutes |
-| Agent forgets early instructions | Context window is too small or compaction is misconfigured | Check `num_ctx` and the model profile |
-| `write_todos` is unavailable | `TodoListMiddleware` was not registered | Keep `middleware=[TodoListMiddleware()]` |
-| `execute` fails with `StateBackend` | That backend does not provide a shell sandbox | Use file tools or a sandbox-capable backend |
-| `glob` raises a `modified_at` error | Seeded files are missing complete metadata | Build seeded values with `create_file_data()` |
+- **`write_todos` isn't in the default middleware stack** on most models. Pass `middleware=[TodoListMiddleware()]` or the planning tool simply doesn't exist.
+- **`result["files"]` maps paths to `FileData` dicts**, not strings. Read `data["content"]`; slicing the dict raises `TypeError: unhashable type: 'slice'`.
 
-For additional cases, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
-
-## Project structure
-
-```text
-.
-├── src/
-│   ├── 00_doctor.py
-│   ├── 01_shallow_agent.py
-│   ├── 02_deep_agent.py
-│   ├── 03_observed_agent.py
-│   ├── 04_toolbox_agent.py
-│   ├── 05_ollabridge_demo.py
-│   ├── 06_advanced_agent.py
-│   ├── local_model.py
-│   ├── progress.py
-│   └── search.py
-├── assets/images/posts/2026-08-23-Deep-Agents-Ollama/
-├── .env.example
-├── Makefile
-├── Modelfile.example
-├── pyproject.toml
-└── uv.lock
-```
-
-## Further reading
-
-- [Deep Agents](https://github.com/langchain-ai/deepagents)
-- [Ollama](https://ollama.com/)
-- [LangChain](https://github.com/langchain-ai/langchain)
-- [Langfuse](https://langfuse.com/)
-- [Tavily](https://tavily.com/)
-- [OllaBridge](https://github.com/ruslanmv/ollabridge)
-
----
-
-Created by [Ruslan Magana Vsevolodovna](https://ruslanmv.com). If this lab helps you, consider starring the repository and sharing what you build.
+A deep agent run makes many model calls, so expect it to take noticeably longer than a single completion — locally you feel every one.

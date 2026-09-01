@@ -32,6 +32,7 @@ DEFAULT_MODEL = "qwen3:8b"
 # raise this — see the table in the README.
 DEFAULT_NUM_CTX = 24_576
 DEFAULT_KEEP_ALIVE = "30m"
+DEFAULT_PORT = 11434
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -39,6 +40,74 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_base_url(raw: str) -> str:
+    """Turn whatever someone put in `OLLAMA_HOST` into a URL the client can use.
+
+    `OLLAMA_HOST` is Ollama's *own* environment variable, and its documented
+    form is `host:port` with no scheme — so people quite reasonably set
+    `localhost` or `127.0.0.1:11434`. Those happen to work, because the client
+    fills in the missing pieces.
+
+    The one that does not is a scheme with no port: `http://localhost` resolves
+    to port 80, gets a connection refused, and reads like the daemon is down.
+    This adds the default port in that case, and leaves an explicit port or an
+    https endpoint (which is behind a proxy on 443) alone.
+    """
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return "http://localhost:11434"
+    if "://" not in url:
+        url = "http://" + url
+    scheme, _, rest = url.partition("://")
+    host = rest.split("/", 1)[0]
+    # An explicit port, an IPv6 literal, or TLS (assume 443 behind a proxy).
+    if ":" in host.rsplit("]", 1)[-1] or scheme == "https":
+        return url
+    return f"{scheme}://{rest}:{DEFAULT_PORT}" if "/" not in rest else url
+
+
+def gpu_residency(base_url: str | None = None, timeout: float = 3.0):
+    """How much of the loaded model is actually on the GPU, per Ollama.
+
+    Returns `{"name", "total", "on_gpu", "pct"}` for the resident model, or
+    `None` when nothing is loaded or the daemon cannot be reached. Estimates
+    lie about this; `/api/ps` measures it.
+
+    This is the difference between a run that takes 49 seconds and one that
+    takes ten minutes, and nothing else in a run tells you which you are in.
+    """
+    import json  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    url = normalize_base_url(base_url or os.environ.get("OLLAMA_HOST", ""))
+    # Ollama is on this machine, so go straight at it. A corporate `http_proxy`
+    # that does not list localhost in `no_proxy` would otherwise swallow the
+    # probe and quietly cost you the warning.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"{url}/api/ps", timeout=timeout) as resp:
+            running = (json.loads(resp.read()) or {}).get("models") or []
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    if not running:
+        return None
+
+    wanted = os.environ.get("DEEP_AGENT_MODEL", DEFAULT_MODEL)
+    wanted = wanted if ":" in wanted else f"{wanted}:latest"
+    entry = next((m for m in running if m.get("name") == wanted), running[0])
+    total = entry.get("size") or 0
+    if not total:
+        return None
+    on_gpu = entry.get("size_vram") or 0
+    return {
+        "name": entry.get("name", "?"),
+        "total": total,
+        "on_gpu": on_gpu,
+        "pct": on_gpu / total * 100,
+    }
 
 
 def ollabridge_api_key() -> str:
@@ -139,7 +208,7 @@ def build_ollama_model(*, validate: bool = True, **overrides) -> ChatOllama:
 
     settings = {
         "model": os.environ.get("DEEP_AGENT_MODEL", DEFAULT_MODEL),
-        "base_url": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+        "base_url": normalize_base_url(os.environ.get("OLLAMA_HOST", "")),
         "num_ctx": num_ctx,
         "keep_alive": os.environ.get("DEEP_AGENT_KEEP_ALIVE", DEFAULT_KEEP_ALIVE),
         "reasoning": _env_flag("DEEP_AGENT_REASONING", default=False),
