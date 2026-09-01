@@ -15,7 +15,7 @@
 
 </div>
 
-![Deep Agents on Your Own GPU](assets/images/posts/2026-08-23-Deep-Agents-Ollama/deep-agents-ollama.jpg)
+
 
 ## Overview
 
