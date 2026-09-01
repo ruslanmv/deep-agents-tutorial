@@ -1,0 +1,20 @@
+[project]
+name = "deep-agents-tutorial"
+version = "0.3.0"
+description = "Build a deep agent that runs on your own GPU, with Ollama and deepagents."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents>=0.7.0",
+    "langchain>=1.0.0",
+    "langchain-ollama>=1.0.0",
+    "tavily-python>=0.5.0",
+    "langfuse>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "langchain-openai>=1.6.0",
+]
+
+# We're not building a library here, just a folder of scripts to run.
+# This tells uv to manage dependencies without trying to package src/.
+[tool.uv]
+package = false
